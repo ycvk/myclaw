@@ -3,7 +3,7 @@ module github.com/stellarlinkco/myclaw
 go 1.24.0
 
 require (
-	github.com/cexll/agentsdk-go v0.7.0
+	github.com/cexll/agentsdk-go v0.8.2
 	github.com/go-telegram-bot-api/telegram-bot-api/v5 v5.5.1
 	github.com/robfig/cron/v3 v3.0.1
 	github.com/spf13/cobra v1.8.1
@@ -21,6 +21,7 @@ require (
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.27.7 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/modelcontextprotocol/go-sdk v1.1.0 // indirect
+	github.com/openai/openai-go v1.12.0 // indirect
 	github.com/spf13/pflag v1.0.5 // indirect
 	github.com/tidwall/gjson v1.18.0 // indirect
 	github.com/tidwall/match v1.1.1 // indirect
