@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 )
 
 const (
@@ -43,7 +44,7 @@ type ProviderConfig struct {
 type ChannelsConfig struct {
 	Telegram TelegramConfig `json:"telegram"`
 	Feishu   FeishuConfig   `json:"feishu"`
-	WeCom    WeComConfig    `json:"wecom"`
+	WeComApp WeComAppConfig `json:"wecom-app"`
 }
 
 type TelegramConfig struct {
@@ -63,11 +64,16 @@ type FeishuConfig struct {
 	AllowFrom         []string `json:"allowFrom"`
 }
 
-type WeComConfig struct {
+type WeComAppConfig struct {
 	Enabled        bool     `json:"enabled"`
+	WebhookPath    string   `json:"webhookPath,omitempty"`
 	Token          string   `json:"token"`
 	EncodingAESKey string   `json:"encodingAESKey"`
 	ReceiveID      string   `json:"receiveId,omitempty"`
+	CorpID         string   `json:"corpId,omitempty"`
+	CorpSecret     string   `json:"corpSecret,omitempty"`
+	AgentID        int      `json:"agentId,omitempty"`
+	APIBaseURL     string   `json:"apiBaseUrl,omitempty"`
 	Port           int      `json:"port,omitempty"`
 	AllowFrom      []string `json:"allowFrom"`
 }
@@ -160,14 +166,28 @@ func LoadConfig() (*Config, error) {
 	if appSecret := os.Getenv("MYCLAW_FEISHU_APP_SECRET"); appSecret != "" {
 		cfg.Channels.Feishu.AppSecret = appSecret
 	}
-	if token := os.Getenv("MYCLAW_WECOM_TOKEN"); token != "" {
-		cfg.Channels.WeCom.Token = token
+	if token := os.Getenv("MYCLAW_WECOM_APP_TOKEN"); token != "" {
+		cfg.Channels.WeComApp.Token = token
 	}
-	if aesKey := os.Getenv("MYCLAW_WECOM_ENCODING_AES_KEY"); aesKey != "" {
-		cfg.Channels.WeCom.EncodingAESKey = aesKey
+	if aesKey := os.Getenv("MYCLAW_WECOM_APP_ENCODING_AES_KEY"); aesKey != "" {
+		cfg.Channels.WeComApp.EncodingAESKey = aesKey
 	}
-	if receiveID := os.Getenv("MYCLAW_WECOM_RECEIVE_ID"); receiveID != "" {
-		cfg.Channels.WeCom.ReceiveID = receiveID
+	if receiveID := os.Getenv("MYCLAW_WECOM_APP_RECEIVE_ID"); receiveID != "" {
+		cfg.Channels.WeComApp.ReceiveID = receiveID
+	}
+	if corpID := os.Getenv("MYCLAW_WECOM_APP_CORP_ID"); corpID != "" {
+		cfg.Channels.WeComApp.CorpID = corpID
+	}
+	if corpSecret := os.Getenv("MYCLAW_WECOM_APP_CORP_SECRET"); corpSecret != "" {
+		cfg.Channels.WeComApp.CorpSecret = corpSecret
+	}
+	if agentID := os.Getenv("MYCLAW_WECOM_APP_AGENT_ID"); agentID != "" {
+		if parsed, err := strconv.Atoi(agentID); err == nil {
+			cfg.Channels.WeComApp.AgentID = parsed
+		}
+	}
+	if apiBaseURL := os.Getenv("MYCLAW_WECOM_APP_API_BASE_URL"); apiBaseURL != "" {
+		cfg.Channels.WeComApp.APIBaseURL = apiBaseURL
 	}
 
 	if cfg.Agent.Workspace == "" {
