@@ -253,8 +253,8 @@ func TestRunStatus(t *testing.T) {
 	if !strings.Contains(output, "Feishu: enabled=") {
 		t.Errorf("missing Feishu status in output: %s", output)
 	}
-	if !strings.Contains(output, "WeCom: enabled=") {
-		t.Errorf("missing WeCom status in output: %s", output)
+	if !strings.Contains(output, "WeCom App: enabled=") {
+		t.Errorf("missing WeCom App status in output: %s", output)
 	}
 }
 

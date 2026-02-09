@@ -293,7 +293,7 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	}
 	fmt.Printf("Telegram: enabled=%v\n", cfg.Channels.Telegram.Enabled)
 	fmt.Printf("Feishu: enabled=%v\n", cfg.Channels.Feishu.Enabled)
-	fmt.Printf("WeCom: enabled=%v\n", cfg.Channels.WeCom.Enabled)
+	fmt.Printf("WeCom App: enabled=%v\n", cfg.Channels.WeComApp.Enabled)
 
 	if _, err := os.Stat(cfg.Agent.Workspace); err != nil {
 		fmt.Println("Workspace: not found (run 'myclaw onboard')")

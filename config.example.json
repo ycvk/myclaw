@@ -27,11 +27,16 @@
       "port": 9876,
       "allowFrom": []
     },
-    "wecom": {
+    "wecom-app": {
       "enabled": false,
+      "webhookPath": "/wecom-app",
       "token": "",
       "encodingAESKey": "",
       "receiveId": "",
+      "corpId": "",
+      "corpSecret": "",
+      "agentId": 0,
+      "apiBaseUrl": "",
       "port": 9886,
       "allowFrom": []
     }

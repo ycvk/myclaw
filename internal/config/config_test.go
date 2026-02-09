@@ -281,28 +281,44 @@ func TestLoadConfig_MYCLAWBaseURL(t *testing.T) {
 	}
 }
 
-func TestLoadConfig_WeComEnvOverrides(t *testing.T) {
+func TestLoadConfig_WeComAppEnvOverrides(t *testing.T) {
 	tmpDir := t.TempDir()
 	origHome := os.Getenv("HOME")
 	t.Setenv("HOME", tmpDir)
 	defer os.Setenv("HOME", origHome)
 
-	t.Setenv("MYCLAW_WECOM_TOKEN", "wecom-token")
-	t.Setenv("MYCLAW_WECOM_ENCODING_AES_KEY", "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG")
-	t.Setenv("MYCLAW_WECOM_RECEIVE_ID", "wecom-receive-id")
+	t.Setenv("MYCLAW_WECOM_APP_TOKEN", "wecom-app-token")
+	t.Setenv("MYCLAW_WECOM_APP_ENCODING_AES_KEY", "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG")
+	t.Setenv("MYCLAW_WECOM_APP_RECEIVE_ID", "wecom-app-receive-id")
+	t.Setenv("MYCLAW_WECOM_APP_CORP_ID", "wwcorp123")
+	t.Setenv("MYCLAW_WECOM_APP_CORP_SECRET", "corp-secret")
+	t.Setenv("MYCLAW_WECOM_APP_AGENT_ID", "1000002")
+	t.Setenv("MYCLAW_WECOM_APP_API_BASE_URL", "https://proxy.example.com")
 
 	cfg, err := LoadConfig()
 	if err != nil {
 		t.Fatalf("LoadConfig error: %v", err)
 	}
 
-	if cfg.Channels.WeCom.Token != "wecom-token" {
-		t.Errorf("wecom token = %q, want wecom-token", cfg.Channels.WeCom.Token)
+	if cfg.Channels.WeComApp.Token != "wecom-app-token" {
+		t.Errorf("wecom-app token = %q, want wecom-app-token", cfg.Channels.WeComApp.Token)
 	}
-	if cfg.Channels.WeCom.EncodingAESKey != "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG" {
-		t.Errorf("wecom aes key = %q, want configured value", cfg.Channels.WeCom.EncodingAESKey)
+	if cfg.Channels.WeComApp.EncodingAESKey != "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG" {
+		t.Errorf("wecom-app aes key = %q, want configured value", cfg.Channels.WeComApp.EncodingAESKey)
 	}
-	if cfg.Channels.WeCom.ReceiveID != "wecom-receive-id" {
-		t.Errorf("wecom receiveId = %q, want wecom-receive-id", cfg.Channels.WeCom.ReceiveID)
+	if cfg.Channels.WeComApp.ReceiveID != "wecom-app-receive-id" {
+		t.Errorf("wecom-app receiveId = %q, want wecom-app-receive-id", cfg.Channels.WeComApp.ReceiveID)
+	}
+	if cfg.Channels.WeComApp.CorpID != "wwcorp123" {
+		t.Errorf("wecom-app corpId = %q, want wwcorp123", cfg.Channels.WeComApp.CorpID)
+	}
+	if cfg.Channels.WeComApp.CorpSecret != "corp-secret" {
+		t.Errorf("wecom-app corpSecret = %q, want corp-secret", cfg.Channels.WeComApp.CorpSecret)
+	}
+	if cfg.Channels.WeComApp.AgentID != 1000002 {
+		t.Errorf("wecom-app agentId = %d, want 1000002", cfg.Channels.WeComApp.AgentID)
+	}
+	if cfg.Channels.WeComApp.APIBaseURL != "https://proxy.example.com" {
+		t.Errorf("wecom-app apiBaseUrl = %q, want https://proxy.example.com", cfg.Channels.WeComApp.APIBaseURL)
 	}
 }

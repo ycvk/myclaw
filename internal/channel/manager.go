@@ -47,10 +47,10 @@ func NewChannelManager(cfg config.ChannelsConfig, b *bus.MessageBus) (*ChannelMa
 		})
 	}
 
-	if cfg.WeCom.Enabled {
-		ch, err := NewWeComChannel(cfg.WeCom, b)
+	if cfg.WeComApp.Enabled {
+		ch, err := NewWeComChannel(cfg.WeComApp, b)
 		if err != nil {
-			return nil, fmt.Errorf("init wecom channel: %w", err)
+			return nil, fmt.Errorf("init wecom-app channel: %w", err)
 		}
 		m.channels[ch.Name()] = ch
 		b.SubscribeOutbound(ch.Name(), func(msg bus.OutboundMessage) {

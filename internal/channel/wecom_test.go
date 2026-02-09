@@ -22,47 +22,45 @@ import (
 	"github.com/stellarlinkco/myclaw/internal/config"
 )
 
-type mockWeComSend struct {
-	ResponseURL string
-	Message     bus.OutboundMessage
-}
-
 type mockWeComClient struct {
-	sent []mockWeComSend
+	sent []bus.OutboundMessage
 	err  error
 }
 
-func (m *mockWeComClient) SendMessage(ctx context.Context, responseURL string, msg bus.OutboundMessage) error {
-	m.sent = append(m.sent, mockWeComSend{ResponseURL: responseURL, Message: msg})
+func (m *mockWeComClient) SendMessage(ctx context.Context, msg bus.OutboundMessage) error {
+	m.sent = append(m.sent, msg)
 	return m.err
 }
 
 func (m *mockWeComClient) Close() {}
 
 func mockWeComClientFactory(client *mockWeComClient) WeComClientFactory {
-	return func(cfg config.WeComConfig) WeComClient {
+	return func(cfg config.WeComAppConfig) WeComClient {
 		return client
 	}
 }
 
 func TestNewWeComChannel_Valid(t *testing.T) {
 	b := bus.NewMessageBus(10)
-	ch, err := NewWeComChannel(config.WeComConfig{
+	ch, err := NewWeComChannel(config.WeComAppConfig{
 		Token:          "verify-token",
 		EncodingAESKey: "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG",
 		ReceiveID:      "recv-id-1",
+		CorpID:         "wwcorp",
+		CorpSecret:     "corp-secret",
+		AgentID:        1000002,
 	}, b)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if ch.Name() != "wecom" {
-		t.Errorf("Name = %q, want wecom", ch.Name())
+	if ch.Name() != "wecom-app" {
+		t.Errorf("Name = %q, want wecom-app", ch.Name())
 	}
 }
 
 func TestNewWeComChannel_MissingRequiredConfig(t *testing.T) {
 	b := bus.NewMessageBus(10)
-	_, err := NewWeComChannel(config.WeComConfig{}, b)
+	_, err := NewWeComChannel(config.WeComAppConfig{}, b)
 	if err == nil {
 		t.Fatal("expected error for empty config")
 	}
@@ -70,9 +68,12 @@ func TestNewWeComChannel_MissingRequiredConfig(t *testing.T) {
 
 func TestWeComChannel_Send_NilClient(t *testing.T) {
 	b := bus.NewMessageBus(10)
-	ch, _ := NewWeComChannelWithFactory(config.WeComConfig{
+	ch, _ := NewWeComChannelWithFactory(config.WeComAppConfig{
 		Token:          "verify-token",
 		EncodingAESKey: "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG",
+		CorpID:         "wwcorp",
+		CorpSecret:     "corp-secret",
+		AgentID:        1000002,
 	}, b, nil)
 
 	err := ch.Send(bus.OutboundMessage{ChatID: "zhangsan", Content: "hello"})
@@ -82,11 +83,14 @@ func TestWeComChannel_Send_NilClient(t *testing.T) {
 }
 
 func TestWeComCallback_VerifyURL_OK(t *testing.T) {
-	ch, _ := newTestWeComChannel(t, config.WeComConfig{
+	ch, _ := newTestWeComChannel(t, config.WeComAppConfig{
 		Token:          "verify-token",
 		EncodingAESKey: "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG",
 		ReceiveID:      "recv-id-1",
 		AllowFrom:      []string{"zhangsan"},
+		CorpID:         "wwcorp",
+		CorpSecret:     "corp-secret",
+		AgentID:        1000002,
 	})
 
 	timestamp := "1739000000"
@@ -94,7 +98,7 @@ func TestWeComCallback_VerifyURL_OK(t *testing.T) {
 	echostr := testWeComEncrypt(t, ch.cfg.EncodingAESKey, ch.receiveID, "hello-challenge")
 	signature := testWeComSignature(ch.cfg.Token, timestamp, nonce, echostr)
 
-	req := httptest.NewRequest(http.MethodGet, "/wecom/bot", nil)
+	req := httptest.NewRequest(http.MethodGet, "/wecom-app", nil)
 	q := req.URL.Query()
 	q.Set("msg_signature", signature)
 	q.Set("timestamp", timestamp)
@@ -114,13 +118,16 @@ func TestWeComCallback_VerifyURL_OK(t *testing.T) {
 }
 
 func TestWeComCallback_VerifyURL_BadSignature(t *testing.T) {
-	ch, _ := newTestWeComChannel(t, config.WeComConfig{
+	ch, _ := newTestWeComChannel(t, config.WeComAppConfig{
 		Token:          "verify-token",
 		EncodingAESKey: "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG",
 		ReceiveID:      "recv-id-1",
+		CorpID:         "wwcorp",
+		CorpSecret:     "corp-secret",
+		AgentID:        1000002,
 	})
 
-	req := httptest.NewRequest(http.MethodGet, "/wecom/bot?msg_signature=bad&timestamp=1&nonce=2&echostr=abc", nil)
+	req := httptest.NewRequest(http.MethodGet, "/wecom-app?msg_signature=bad&timestamp=1&nonce=2&echostr=abc", nil)
 	w := httptest.NewRecorder()
 
 	ch.handleCallback(w, req)
@@ -130,22 +137,25 @@ func TestWeComCallback_VerifyURL_BadSignature(t *testing.T) {
 	}
 }
 
-func TestWeComCallback_ReceiveTextMessage_OK(t *testing.T) {
-	ch, b := newTestWeComChannel(t, config.WeComConfig{
+func TestWeComCallback_ReceiveJSONTextMessage_OK(t *testing.T) {
+	ch, b := newTestWeComChannel(t, config.WeComAppConfig{
 		Token:          "verify-token",
 		EncodingAESKey: "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG",
 		ReceiveID:      "recv-id-1",
 		AllowFrom:      []string{"zhangsan"},
+		CorpID:         "wwcorp",
+		CorpSecret:     "corp-secret",
+		AgentID:        1000002,
 	})
 
 	timestamp := "1739000001"
 	nonce := "nonce-2"
-	plaintext := `{"msgid":"10001","aibotid":"AIBOTID","chattype":"single","from":{"userid":"zhangsan"},"response_url":"https://example.com/resp","msgtype":"text","text":{"content":"你好，myclaw"}}`
+	plaintext := `{"MsgId":"10001","FromUserName":"zhangsan","MsgType":"text","Content":"你好，myclaw"}`
 	encrypt := testWeComEncrypt(t, ch.cfg.EncodingAESKey, ch.receiveID, plaintext)
 	signature := testWeComSignature(ch.cfg.Token, timestamp, nonce, encrypt)
 
-	body := testWeComEncryptedRequestBody(t, encrypt)
-	req := httptest.NewRequest(http.MethodPost, "/wecom/bot", strings.NewReader(body))
+	body := testWeComEncryptedJSONBody(t, encrypt)
+	req := httptest.NewRequest(http.MethodPost, "/wecom-app", strings.NewReader(body))
 	q := req.URL.Query()
 	q.Set("msg_signature", signature)
 	q.Set("timestamp", timestamp)
@@ -166,12 +176,6 @@ func TestWeComCallback_ReceiveTextMessage_OK(t *testing.T) {
 	if reply.Encrypt == "" {
 		t.Fatal("reply encrypt should not be empty")
 	}
-	if reply.MsgSignature == "" {
-		t.Fatal("reply msgsignature should not be empty")
-	}
-	if reply.MsgSignature != testWeComSignature(ch.cfg.Token, reply.Timestamp, reply.Nonce, reply.Encrypt) {
-		t.Fatal("reply msgsignature mismatch")
-	}
 
 	ackPlain := testWeComDecrypt(t, ch.cfg.EncodingAESKey, ch.receiveID, reply.Encrypt)
 	if strings.TrimSpace(ackPlain) != `"success"` {
@@ -180,8 +184,8 @@ func TestWeComCallback_ReceiveTextMessage_OK(t *testing.T) {
 
 	select {
 	case msg := <-b.Inbound:
-		if msg.Channel != "wecom" {
-			t.Errorf("channel = %q, want wecom", msg.Channel)
+		if msg.Channel != "wecom-app" {
+			t.Errorf("channel = %q, want wecom-app", msg.Channel)
 		}
 		if msg.SenderID != "zhangsan" {
 			t.Errorf("senderID = %q, want zhangsan", msg.SenderID)
@@ -192,8 +196,50 @@ func TestWeComCallback_ReceiveTextMessage_OK(t *testing.T) {
 		if msg.Content != "你好，myclaw" {
 			t.Errorf("content = %q, want 你好，myclaw", msg.Content)
 		}
-		if msg.Metadata["response_url"] != "https://example.com/resp" {
-			t.Errorf("response_url = %v, want https://example.com/resp", msg.Metadata["response_url"])
+	case <-time.After(time.Second):
+		t.Fatal("expected inbound message")
+	}
+}
+
+func TestWeComCallback_ReceiveXMLTextMessage_OK(t *testing.T) {
+	ch, b := newTestWeComChannel(t, config.WeComAppConfig{
+		Token:          "verify-token",
+		EncodingAESKey: "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG",
+		ReceiveID:      "recv-id-1",
+		AllowFrom:      []string{"lisi"},
+		CorpID:         "wwcorp",
+		CorpSecret:     "corp-secret",
+		AgentID:        1000002,
+	})
+
+	timestamp := "1739000002"
+	nonce := "nonce-3"
+	plaintext := `<xml><ToUserName><![CDATA[toUser]]></ToUserName><FromUserName><![CDATA[lisi]]></FromUserName><CreateTime>1739000002</CreateTime><MsgType><![CDATA[text]]></MsgType><Content><![CDATA[hello xml]]></Content><MsgId>10002</MsgId><AgentID>1000002</AgentID></xml>`
+	encrypt := testWeComEncrypt(t, ch.cfg.EncodingAESKey, ch.receiveID, plaintext)
+	signature := testWeComSignature(ch.cfg.Token, timestamp, nonce, encrypt)
+
+	body := testWeComEncryptedXMLBody(encrypt, signature, timestamp, nonce)
+	req := httptest.NewRequest(http.MethodPost, "/wecom-app", strings.NewReader(body))
+	q := req.URL.Query()
+	q.Set("msg_signature", signature)
+	q.Set("timestamp", timestamp)
+	q.Set("nonce", nonce)
+	req.URL.RawQuery = q.Encode()
+	w := httptest.NewRecorder()
+
+	ch.handleCallback(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+
+	select {
+	case msg := <-b.Inbound:
+		if msg.SenderID != "lisi" {
+			t.Errorf("senderID = %q, want lisi", msg.SenderID)
+		}
+		if msg.Content != "hello xml" {
+			t.Errorf("content = %q, want hello xml", msg.Content)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("expected inbound message")
@@ -201,21 +247,24 @@ func TestWeComCallback_ReceiveTextMessage_OK(t *testing.T) {
 }
 
 func TestWeComCallback_AllowAllWhenAllowListEmpty(t *testing.T) {
-	ch, b := newTestWeComChannel(t, config.WeComConfig{
+	ch, b := newTestWeComChannel(t, config.WeComAppConfig{
 		Token:          "verify-token",
 		EncodingAESKey: "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG",
 		ReceiveID:      "recv-id-1",
 		AllowFrom:      []string{},
+		CorpID:         "wwcorp",
+		CorpSecret:     "corp-secret",
+		AgentID:        1000002,
 	})
 
-	timestamp := "1739000002"
-	nonce := "nonce-3"
-	plaintext := `{"msgid":"10002","aibotid":"AIBOTID","chattype":"single","from":{"userid":"lisi"},"response_url":"https://example.com/resp","msgtype":"text","text":{"content":"hello"}}`
+	timestamp := "1739000003"
+	nonce := "nonce-4"
+	plaintext := `{"MsgId":"10003","FromUserName":"anyone","MsgType":"text","Content":"hello"}`
 	encrypt := testWeComEncrypt(t, ch.cfg.EncodingAESKey, ch.receiveID, plaintext)
 	signature := testWeComSignature(ch.cfg.Token, timestamp, nonce, encrypt)
-	body := testWeComEncryptedRequestBody(t, encrypt)
+	body := testWeComEncryptedJSONBody(t, encrypt)
 
-	req := httptest.NewRequest(http.MethodPost, "/wecom/bot", strings.NewReader(body))
+	req := httptest.NewRequest(http.MethodPost, "/wecom-app", strings.NewReader(body))
 	q := req.URL.Query()
 	q.Set("msg_signature", signature)
 	q.Set("timestamp", timestamp)
@@ -232,10 +281,10 @@ func TestWeComCallback_AllowAllWhenAllowListEmpty(t *testing.T) {
 	select {
 	case msg := <-b.Inbound:
 		if msg.Content != "hello" {
-			t.Errorf("Content = %q, want %q", msg.Content, "hello")
+			t.Errorf("Content = %q, want hello", msg.Content)
 		}
-		if msg.SenderID != "lisi" {
-			t.Errorf("SenderID = %q, want %q", msg.SenderID, "lisi")
+		if msg.SenderID != "anyone" {
+			t.Errorf("SenderID = %q, want anyone", msg.SenderID)
 		}
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("should allow all senders when allowFrom is empty")
@@ -243,22 +292,25 @@ func TestWeComCallback_AllowAllWhenAllowListEmpty(t *testing.T) {
 }
 
 func TestWeComCallback_DuplicateMsgID_Dropped(t *testing.T) {
-	ch, b := newTestWeComChannel(t, config.WeComConfig{
+	ch, b := newTestWeComChannel(t, config.WeComAppConfig{
 		Token:          "verify-token",
 		EncodingAESKey: "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG",
 		ReceiveID:      "recv-id-1",
 		AllowFrom:      []string{"zhangsan"},
+		CorpID:         "wwcorp",
+		CorpSecret:     "corp-secret",
+		AgentID:        1000002,
 	})
 
-	timestamp := "1739000003"
-	nonce := "nonce-4"
-	plaintext := `{"msgid":"20001","aibotid":"AIBOTID","chattype":"single","from":{"userid":"zhangsan"},"response_url":"https://example.com/resp","msgtype":"text","text":{"content":"dup"}}`
+	timestamp := "1739000004"
+	nonce := "nonce-5"
+	plaintext := `{"MsgId":"20001","FromUserName":"zhangsan","MsgType":"text","Content":"dup"}`
 	encrypt := testWeComEncrypt(t, ch.cfg.EncodingAESKey, ch.receiveID, plaintext)
 	signature := testWeComSignature(ch.cfg.Token, timestamp, nonce, encrypt)
-	body := testWeComEncryptedRequestBody(t, encrypt)
+	body := testWeComEncryptedJSONBody(t, encrypt)
 
 	post := func() {
-		req := httptest.NewRequest(http.MethodPost, "/wecom/bot", strings.NewReader(body))
+		req := httptest.NewRequest(http.MethodPost, "/wecom-app", strings.NewReader(body))
 		q := req.URL.Query()
 		q.Set("msg_signature", signature)
 		q.Set("timestamp", timestamp)
@@ -293,16 +345,18 @@ func TestWeComChannel_Send_Success(t *testing.T) {
 	b := bus.NewMessageBus(10)
 	mock := &mockWeComClient{}
 
-	ch, err := NewWeComChannelWithFactory(config.WeComConfig{
+	ch, err := NewWeComChannelWithFactory(config.WeComAppConfig{
 		Token:          "verify-token",
 		EncodingAESKey: "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG",
 		AllowFrom:      []string{"zhangsan"},
+		CorpID:         "wwcorp",
+		CorpSecret:     "corp-secret",
+		AgentID:        1000002,
 	}, b, mockWeComClientFactory(mock))
 	if err != nil {
 		t.Fatalf("new channel error: %v", err)
 	}
 	ch.client = mock
-	ch.replyCache.Set("zhangsan", "https://example.com/response-url")
 
 	err = ch.Send(bus.OutboundMessage{ChatID: "zhangsan", Content: "pong"})
 	if err != nil {
@@ -312,58 +366,58 @@ func TestWeComChannel_Send_Success(t *testing.T) {
 	if len(mock.sent) != 1 {
 		t.Fatalf("sent count = %d, want 1", len(mock.sent))
 	}
-	if mock.sent[0].ResponseURL != "https://example.com/response-url" {
-		t.Errorf("response_url = %q, want https://example.com/response-url", mock.sent[0].ResponseURL)
+	if mock.sent[0].ChatID != "zhangsan" {
+		t.Errorf("chatID = %q, want zhangsan", mock.sent[0].ChatID)
 	}
-	if mock.sent[0].Message.ChatID != "zhangsan" {
-		t.Errorf("chatID = %q, want zhangsan", mock.sent[0].Message.ChatID)
-	}
-	if mock.sent[0].Message.Content != "pong" {
-		t.Errorf("content = %q, want pong", mock.sent[0].Message.Content)
+	if mock.sent[0].Content != "pong" {
+		t.Errorf("content = %q, want pong", mock.sent[0].Content)
 	}
 }
 
-func TestWeComChannel_Send_ResponseURLMissing(t *testing.T) {
+func TestWeComChannel_Send_MissingChatID(t *testing.T) {
 	b := bus.NewMessageBus(10)
 	mock := &mockWeComClient{}
 
-	ch, err := NewWeComChannelWithFactory(config.WeComConfig{
+	ch, err := NewWeComChannelWithFactory(config.WeComAppConfig{
 		Token:          "verify-token",
 		EncodingAESKey: "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG",
 		AllowFrom:      []string{"zhangsan"},
+		CorpID:         "wwcorp",
+		CorpSecret:     "corp-secret",
+		AgentID:        1000002,
 	}, b, mockWeComClientFactory(mock))
 	if err != nil {
 		t.Fatalf("new channel error: %v", err)
 	}
 	ch.client = mock
 
-	err = ch.Send(bus.OutboundMessage{ChatID: "zhangsan", Content: "pong"})
+	err = ch.Send(bus.OutboundMessage{ChatID: "", Content: "pong"})
 	if err == nil {
-		t.Fatal("expected response_url missing error")
-	}
-	if !strings.Contains(err.Error(), "response_url") {
-		t.Fatalf("error = %v, want response_url hint", err)
+		t.Fatal("expected missing chat id error")
 	}
 }
 
-func TestChannelManager_WeComEnabled_MissingConfig(t *testing.T) {
+func TestChannelManager_WeComAppEnabled_MissingConfig(t *testing.T) {
 	b := bus.NewMessageBus(10)
 	_, err := NewChannelManager(config.ChannelsConfig{
-		WeCom: config.WeComConfig{Enabled: true},
+		WeComApp: config.WeComAppConfig{Enabled: true},
 	}, b)
 	if err == nil {
-		t.Fatal("expected error for missing wecom required config")
+		t.Fatal("expected error for missing wecom-app required config")
 	}
 }
 
-func TestChannelManager_WeComEnabled(t *testing.T) {
+func TestChannelManager_WeComAppEnabled(t *testing.T) {
 	b := bus.NewMessageBus(10)
 	m, err := NewChannelManager(config.ChannelsConfig{
-		WeCom: config.WeComConfig{
+		WeComApp: config.WeComAppConfig{
 			Enabled:        true,
 			Token:          "verify-token",
 			EncodingAESKey: "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG",
 			AllowFrom:      []string{"zhangsan"},
+			CorpID:         "wwcorp",
+			CorpSecret:     "corp-secret",
+			AgentID:        1000002,
 		},
 	}, b)
 	if err != nil {
@@ -372,29 +426,407 @@ func TestChannelManager_WeComEnabled(t *testing.T) {
 
 	found := false
 	for _, name := range m.EnabledChannels() {
-		if name == "wecom" {
+		if name == "wecom-app" {
 			found = true
 			break
 		}
 	}
 	if !found {
-		t.Fatalf("enabled channels does not include wecom: %v", m.EnabledChannels())
+		t.Fatalf("enabled channels does not include wecom-app: %v", m.EnabledChannels())
 	}
 }
 
-func newTestWeComChannel(t *testing.T, cfg config.WeComConfig) (*WeComChannel, *bus.MessageBus) {
+func TestWeComClient_Send_IntegrationShape(t *testing.T) {
+	getTokenCalls := 0
+	sendCalls := 0
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/cgi-bin/gettoken":
+			getTokenCalls++
+			if got := r.URL.Query().Get("corpid"); got != "corp-id" {
+				t.Fatalf("corpid = %q, want corp-id", got)
+			}
+			if got := r.URL.Query().Get("corpsecret"); got != "corp-secret" {
+				t.Fatalf("corpsecret = %q, want corp-secret", got)
+			}
+			io.WriteString(w, `{"errcode":0,"errmsg":"ok","access_token":"token-a","expires_in":7200}`)
+		case "/cgi-bin/message/send":
+			sendCalls++
+			if got := r.URL.Query().Get("access_token"); got != "token-a" {
+				t.Fatalf("access_token = %q, want token-a", got)
+			}
+			body, _ := io.ReadAll(r.Body)
+			var payload map[string]any
+			if err := json.Unmarshal(body, &payload); err != nil {
+				t.Fatalf("invalid send payload json: %v", err)
+			}
+			if payload["msgtype"] != "text" {
+				t.Errorf("msgtype = %v, want text", payload["msgtype"])
+			}
+			if payload["touser"] != "zhangsan" {
+				t.Errorf("touser = %v, want zhangsan", payload["touser"])
+			}
+			if int(payload["agentid"].(float64)) != 1000002 {
+				t.Errorf("agentid = %v, want 1000002", payload["agentid"])
+			}
+			text := payload["text"].(map[string]any)
+			if text["content"] != "hello from test" {
+				t.Errorf("content = %v, want hello from test", text["content"])
+			}
+			io.WriteString(w, `{"errcode":0,"errmsg":"ok"}`)
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer ts.Close()
+
+	client := &defaultWeComClient{
+		httpClient: &http.Client{Timeout: 3 * time.Second},
+		cfg: config.WeComAppConfig{
+			CorpID:     "corp-id",
+			CorpSecret: "corp-secret",
+			AgentID:    1000002,
+			APIBaseURL: ts.URL,
+		},
+	}
+
+	err := client.SendMessage(context.Background(), bus.OutboundMessage{ChatID: "zhangsan", Content: "hello from test"})
+	if err != nil {
+		t.Fatalf("send message: %v", err)
+	}
+
+	if getTokenCalls != 1 {
+		t.Fatalf("gettoken calls = %d, want 1", getTokenCalls)
+	}
+	if sendCalls != 1 {
+		t.Fatalf("send calls = %d, want 1", sendCalls)
+	}
+}
+
+func TestWeComClient_Send_Markdown_IntegrationShape(t *testing.T) {
+	getTokenCalls := 0
+	sendCalls := 0
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/cgi-bin/gettoken":
+			getTokenCalls++
+			io.WriteString(w, `{"errcode":0,"errmsg":"ok","access_token":"token-md","expires_in":7200}`)
+		case "/cgi-bin/message/send":
+			sendCalls++
+			if got := r.URL.Query().Get("access_token"); got != "token-md" {
+				t.Fatalf("access_token = %q, want token-md", got)
+			}
+			body, _ := io.ReadAll(r.Body)
+			var payload map[string]any
+			if err := json.Unmarshal(body, &payload); err != nil {
+				t.Fatalf("invalid send payload json: %v", err)
+			}
+			if payload["msgtype"] != "markdown" {
+				t.Errorf("msgtype = %v, want markdown", payload["msgtype"])
+			}
+			if payload["touser"] != "zhangsan" {
+				t.Errorf("touser = %v, want zhangsan", payload["touser"])
+			}
+			markdown := payload["markdown"].(map[string]any)
+			if markdown["content"] != "**hello markdown**" {
+				t.Errorf("markdown content = %v, want **hello markdown**", markdown["content"])
+			}
+			if _, ok := payload["text"]; ok {
+				t.Error("unexpected text field for markdown message")
+			}
+			io.WriteString(w, `{"errcode":0,"errmsg":"ok"}`)
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer ts.Close()
+
+	client := &defaultWeComClient{
+		httpClient: &http.Client{Timeout: 3 * time.Second},
+		cfg: config.WeComAppConfig{
+			CorpID:     "corp-id",
+			CorpSecret: "corp-secret",
+			AgentID:    1000002,
+			APIBaseURL: ts.URL,
+		},
+	}
+
+	err := client.SendMessage(context.Background(), bus.OutboundMessage{
+		ChatID:  "zhangsan",
+		Content: "**hello markdown**",
+		Metadata: map[string]any{
+			"msgtype": "markdown",
+		},
+	})
+	if err != nil {
+		t.Fatalf("send message: %v", err)
+	}
+
+	if getTokenCalls != 1 {
+		t.Fatalf("gettoken calls = %d, want 1", getTokenCalls)
+	}
+	if sendCalls != 1 {
+		t.Fatalf("send calls = %d, want 1", sendCalls)
+	}
+}
+
+func TestWeComClient_Send_MarkdownTruncateLongContent(t *testing.T) {
+	getTokenCalls := 0
+	sendCalls := 0
+	var receivedContent string
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/cgi-bin/gettoken":
+			getTokenCalls++
+			io.WriteString(w, `{"errcode":0,"errmsg":"ok","access_token":"token-md-trunc","expires_in":7200}`)
+		case "/cgi-bin/message/send":
+			sendCalls++
+			body, _ := io.ReadAll(r.Body)
+			var payload map[string]any
+			if err := json.Unmarshal(body, &payload); err != nil {
+				t.Fatalf("invalid send payload json: %v", err)
+			}
+			markdown := payload["markdown"].(map[string]any)
+			receivedContent = markdown["content"].(string)
+			io.WriteString(w, `{"errcode":0,"errmsg":"ok"}`)
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer ts.Close()
+
+	client := &defaultWeComClient{
+		httpClient: &http.Client{Timeout: 3 * time.Second},
+		cfg: config.WeComAppConfig{
+			CorpID:     "corp-id",
+			CorpSecret: "corp-secret",
+			AgentID:    1000002,
+			APIBaseURL: ts.URL,
+		},
+	}
+
+	content := strings.Repeat("B", 5000)
+	err := client.SendMessage(context.Background(), bus.OutboundMessage{
+		ChatID:  "zhangsan",
+		Content: content,
+		Metadata: map[string]any{
+			"msgtype": "markdown",
+		},
+	})
+	if err != nil {
+		t.Fatalf("send message: %v", err)
+	}
+
+	if getTokenCalls != 1 {
+		t.Fatalf("gettoken calls = %d, want 1", getTokenCalls)
+	}
+	if sendCalls != 1 {
+		t.Fatalf("send calls = %d, want 1", sendCalls)
+	}
+	if len([]byte(receivedContent)) > 2048 {
+		t.Fatalf("markdown content bytes = %d, want <= 2048", len([]byte(receivedContent)))
+	}
+}
+
+func TestWeComClient_Send_TruncateLongContent(t *testing.T) {
+	getTokenCalls := 0
+	sendCalls := 0
+	var receivedContent string
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/cgi-bin/gettoken":
+			getTokenCalls++
+			io.WriteString(w, `{"errcode":0,"errmsg":"ok","access_token":"token-b","expires_in":7200}`)
+		case "/cgi-bin/message/send":
+			sendCalls++
+			body, _ := io.ReadAll(r.Body)
+			var payload map[string]any
+			if err := json.Unmarshal(body, &payload); err != nil {
+				t.Fatalf("invalid send payload json: %v", err)
+			}
+			text := payload["text"].(map[string]any)
+			receivedContent = text["content"].(string)
+			io.WriteString(w, `{"errcode":0,"errmsg":"ok"}`)
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer ts.Close()
+
+	client := &defaultWeComClient{
+		httpClient: &http.Client{Timeout: 3 * time.Second},
+		cfg: config.WeComAppConfig{
+			CorpID:     "corp-id",
+			CorpSecret: "corp-secret",
+			AgentID:    1000002,
+			APIBaseURL: ts.URL,
+		},
+	}
+
+	content := strings.Repeat("A", 5000)
+	err := client.SendMessage(context.Background(), bus.OutboundMessage{ChatID: "zhangsan", Content: content})
+	if err != nil {
+		t.Fatalf("send message: %v", err)
+	}
+
+	if getTokenCalls != 1 {
+		t.Fatalf("gettoken calls = %d, want 1", getTokenCalls)
+	}
+	if sendCalls != 1 {
+		t.Fatalf("send calls = %d, want 1", sendCalls)
+	}
+	if len([]byte(receivedContent)) > 2048 {
+		t.Fatalf("content bytes = %d, want <= 2048", len([]byte(receivedContent)))
+	}
+}
+
+func TestWeComClient_Send_RetryTransientErrcode(t *testing.T) {
+	getTokenCalls := 0
+	sendCalls := 0
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/cgi-bin/gettoken":
+			getTokenCalls++
+			io.WriteString(w, `{"errcode":0,"errmsg":"ok","access_token":"token-c","expires_in":7200}`)
+		case "/cgi-bin/message/send":
+			sendCalls++
+			if sendCalls == 1 {
+				io.WriteString(w, `{"errcode":-1,"errmsg":"system busy"}`)
+				return
+			}
+			io.WriteString(w, `{"errcode":0,"errmsg":"ok"}`)
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer ts.Close()
+
+	client := &defaultWeComClient{
+		httpClient: &http.Client{Timeout: 3 * time.Second},
+		cfg: config.WeComAppConfig{
+			CorpID:     "corp-id",
+			CorpSecret: "corp-secret",
+			AgentID:    1000002,
+			APIBaseURL: ts.URL,
+		},
+	}
+
+	err := client.SendMessage(context.Background(), bus.OutboundMessage{ChatID: "zhangsan", Content: "retry me"})
+	if err != nil {
+		t.Fatalf("send message: %v", err)
+	}
+	if getTokenCalls != 1 {
+		t.Fatalf("gettoken calls = %d, want 1", getTokenCalls)
+	}
+	if sendCalls != 2 {
+		t.Fatalf("send calls = %d, want 2", sendCalls)
+	}
+}
+
+func TestWeComClient_Send_NoRetryOnPayloadErrcode(t *testing.T) {
+	getTokenCalls := 0
+	sendCalls := 0
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/cgi-bin/gettoken":
+			getTokenCalls++
+			io.WriteString(w, `{"errcode":0,"errmsg":"ok","access_token":"token-d","expires_in":7200}`)
+		case "/cgi-bin/message/send":
+			sendCalls++
+			io.WriteString(w, `{"errcode":44004,"errmsg":"content size out of limit"}`)
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer ts.Close()
+
+	client := &defaultWeComClient{
+		httpClient: &http.Client{Timeout: 3 * time.Second},
+		cfg: config.WeComAppConfig{
+			CorpID:     "corp-id",
+			CorpSecret: "corp-secret",
+			AgentID:    1000002,
+			APIBaseURL: ts.URL,
+		},
+	}
+
+	err := client.SendMessage(context.Background(), bus.OutboundMessage{ChatID: "zhangsan", Content: "payload error"})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "44004") {
+		t.Fatalf("error = %v, want errcode 44004", err)
+	}
+	if getTokenCalls != 1 {
+		t.Fatalf("gettoken calls = %d, want 1", getTokenCalls)
+	}
+	if sendCalls != 1 {
+		t.Fatalf("send calls = %d, want 1", sendCalls)
+	}
+}
+
+func TestWeComClient_Send_UseAccessTokenCache(t *testing.T) {
+	getTokenCalls := 0
+	sendCalls := 0
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/cgi-bin/gettoken":
+			getTokenCalls++
+			io.WriteString(w, `{"errcode":0,"errmsg":"ok","access_token":"token-cache","expires_in":7200}`)
+		case "/cgi-bin/message/send":
+			sendCalls++
+			io.WriteString(w, `{"errcode":0,"errmsg":"ok"}`)
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer ts.Close()
+
+	client := &defaultWeComClient{
+		httpClient: &http.Client{Timeout: 3 * time.Second},
+		cfg: config.WeComAppConfig{
+			CorpID:     "corp-id",
+			CorpSecret: "corp-secret",
+			AgentID:    1000002,
+			APIBaseURL: ts.URL,
+		},
+	}
+
+	if err := client.SendMessage(context.Background(), bus.OutboundMessage{ChatID: "zhangsan", Content: "first"}); err != nil {
+		t.Fatalf("first send: %v", err)
+	}
+	if err := client.SendMessage(context.Background(), bus.OutboundMessage{ChatID: "lisi", Content: "second"}); err != nil {
+		t.Fatalf("second send: %v", err)
+	}
+
+	if getTokenCalls != 1 {
+		t.Fatalf("gettoken calls = %d, want 1", getTokenCalls)
+	}
+	if sendCalls != 2 {
+		t.Fatalf("send calls = %d, want 2", sendCalls)
+	}
+}
+
+func newTestWeComChannel(t *testing.T, cfg config.WeComAppConfig) (*WeComChannel, *bus.MessageBus) {
 	t.Helper()
 	b := bus.NewMessageBus(10)
 	mock := &mockWeComClient{}
 	ch, err := NewWeComChannelWithFactory(cfg, b, mockWeComClientFactory(mock))
 	if err != nil {
-		t.Fatalf("new wecom channel error: %v", err)
+		t.Fatalf("new wecom-app channel error: %v", err)
 	}
 	ch.client = mock
 	return ch, b
 }
 
-func testWeComEncryptedRequestBody(t *testing.T, encrypt string) string {
+func testWeComEncryptedJSONBody(t *testing.T, encrypt string) string {
 	t.Helper()
 	body := map[string]string{"encrypt": encrypt}
 	data, err := json.Marshal(body)
@@ -402,6 +834,10 @@ func testWeComEncryptedRequestBody(t *testing.T, encrypt string) string {
 		t.Fatalf("marshal encrypted body: %v", err)
 	}
 	return string(data)
+}
+
+func testWeComEncryptedXMLBody(encrypt, signature, timestamp, nonce string) string {
+	return fmt.Sprintf(`<xml><Encrypt><![CDATA[%s]]></Encrypt><MsgSignature><![CDATA[%s]]></MsgSignature><TimeStamp>%s</TimeStamp><Nonce><![CDATA[%s]]></Nonce></xml>`, encrypt, signature, timestamp, nonce)
 }
 
 func testWeComEncrypt(t *testing.T, encodingAESKey, receiveID, plaintext string) string {
@@ -495,128 +931,4 @@ func testWeComSignature(token, timestamp, nonce, data string) string {
 	s := strings.Join(items, "")
 	sum := sha1.Sum([]byte(s))
 	return fmt.Sprintf("%x", sum)
-}
-
-func TestWeComClient_Send_IntegrationShape(t *testing.T) {
-	sendCalls := 0
-
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/reply" {
-			t.Fatalf("unexpected path: %s", r.URL.Path)
-		}
-		sendCalls++
-		body, _ := io.ReadAll(r.Body)
-		var payload map[string]any
-		if err := json.Unmarshal(body, &payload); err != nil {
-			t.Fatalf("invalid send payload json: %v", err)
-		}
-		if payload["msgtype"] != "markdown" {
-			t.Errorf("msgtype = %v, want markdown", payload["msgtype"])
-		}
-		md := payload["markdown"].(map[string]any)
-		if md["content"] != "hello from test" {
-			t.Errorf("content = %v, want hello from test", md["content"])
-		}
-		io.WriteString(w, `{"errcode":0,"errmsg":"ok"}`)
-	}))
-	defer ts.Close()
-
-	client := &defaultWeComClient{
-		httpClient: &http.Client{Timeout: 3 * time.Second},
-	}
-
-	err := client.SendMessage(context.Background(), ts.URL+"/reply", bus.OutboundMessage{ChatID: "zhangsan", Content: "hello from test"})
-	if err != nil {
-		t.Fatalf("send message: %v", err)
-	}
-
-	if sendCalls != 1 {
-		t.Fatalf("send calls = %d, want 1", sendCalls)
-	}
-}
-
-func TestWeComClient_Send_TruncateLongContent(t *testing.T) {
-	sendCalls := 0
-	var receivedContent string
-
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		sendCalls++
-		body, _ := io.ReadAll(r.Body)
-		var payload map[string]any
-		if err := json.Unmarshal(body, &payload); err != nil {
-			t.Fatalf("invalid send payload json: %v", err)
-		}
-		md := payload["markdown"].(map[string]any)
-		receivedContent = md["content"].(string)
-		io.WriteString(w, `{"errcode":0,"errmsg":"ok"}`)
-	}))
-	defer ts.Close()
-
-	client := &defaultWeComClient{
-		httpClient: &http.Client{Timeout: 3 * time.Second},
-	}
-
-	content := strings.Repeat("A", 25000)
-	err := client.SendMessage(context.Background(), ts.URL, bus.OutboundMessage{ChatID: "zhangsan", Content: content})
-	if err != nil {
-		t.Fatalf("send message: %v", err)
-	}
-
-	if sendCalls != 1 {
-		t.Fatalf("send calls = %d, want 1 (response_url is single-use)", sendCalls)
-	}
-	if len([]byte(receivedContent)) > 20480 {
-		t.Fatalf("content bytes = %d, want <= 20480", len([]byte(receivedContent)))
-	}
-}
-
-func TestWeComClient_Send_RetryTransientErrcode(t *testing.T) {
-	sendCalls := 0
-
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		sendCalls++
-		if sendCalls == 1 {
-			io.WriteString(w, `{"errcode":-1,"errmsg":"system busy"}`)
-			return
-		}
-		io.WriteString(w, `{"errcode":0,"errmsg":"ok"}`)
-	}))
-	defer ts.Close()
-
-	client := &defaultWeComClient{
-		httpClient: &http.Client{Timeout: 3 * time.Second},
-	}
-
-	err := client.SendMessage(context.Background(), ts.URL, bus.OutboundMessage{ChatID: "zhangsan", Content: "retry me"})
-	if err != nil {
-		t.Fatalf("send message: %v", err)
-	}
-	if sendCalls != 2 {
-		t.Fatalf("send calls = %d, want 2", sendCalls)
-	}
-}
-
-func TestWeComClient_Send_NoRetryOnPayloadErrcode(t *testing.T) {
-	sendCalls := 0
-
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		sendCalls++
-		io.WriteString(w, `{"errcode":44004,"errmsg":"content size out of limit"}`)
-	}))
-	defer ts.Close()
-
-	client := &defaultWeComClient{
-		httpClient: &http.Client{Timeout: 3 * time.Second},
-	}
-
-	err := client.SendMessage(context.Background(), ts.URL, bus.OutboundMessage{ChatID: "zhangsan", Content: "payload error"})
-	if err == nil {
-		t.Fatal("expected error")
-	}
-	if !strings.Contains(err.Error(), "44004") {
-		t.Fatalf("error = %v, want errcode 44004", err)
-	}
-	if sendCalls != 1 {
-		t.Fatalf("send calls = %d, want 1", sendCalls)
-	}
 }

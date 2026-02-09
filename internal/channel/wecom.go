@@ -10,11 +10,13 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"sync"
@@ -25,26 +27,43 @@ import (
 	"github.com/stellarlinkco/myclaw/internal/config"
 )
 
-const wecomChannelName = "wecom"
+const wecomChannelName = "wecom-app"
 
 const (
-	wecomDefaultPort          = 9886
-	wecomDefaultMsgCacheTTL   = 5 * time.Minute
-	wecomDefaultMsgCacheScan  = 1 * time.Minute
-	wecomDefaultReplyCacheTTL = 1 * time.Hour
-	wecomMarkdownMaxBytes     = 20480
-	wecomSendMaxRetries       = 3
+	wecomDefaultPort        = 9886
+	wecomDefaultMsgCacheTTL = 5 * time.Minute
+	wecomDefaultMsgCacheGC  = 1 * time.Minute
+	wecomTextMaxBytes       = 2048
+	wecomMarkdownMaxBytes   = 2048
+	wecomSendMaxRetries     = 3
+)
+
+const (
+	wecomMsgTypeText     = "text"
+	wecomMsgTypeMarkdown = "markdown"
 )
 
 type WeComClient interface {
-	SendMessage(ctx context.Context, responseURL string, msg bus.OutboundMessage) error
+	SendMessage(ctx context.Context, msg bus.OutboundMessage) error
 	Close()
 }
 
-type WeComClientFactory func(cfg config.WeComConfig) WeComClient
+type WeComClientFactory func(cfg config.WeComAppConfig) WeComClient
 
 type defaultWeComClient struct {
 	httpClient *http.Client
+	cfg        config.WeComAppConfig
+
+	tokenMu        sync.Mutex
+	accessToken    string
+	accessTokenExp time.Time
+}
+
+type weComTokenResponse struct {
+	ErrCode     int    `json:"errcode"`
+	ErrMsg      string `json:"errmsg"`
+	AccessToken string `json:"access_token"`
+	ExpiresIn   int    `json:"expires_in"`
 }
 
 type weComSendResponse struct {
@@ -58,43 +77,64 @@ type weComAPIError struct {
 }
 
 func (e *weComAPIError) Error() string {
-	return fmt.Sprintf("wecom send error: %d %s", e.Code, e.Msg)
+	return fmt.Sprintf("wecom-app api error: %d %s", e.Code, e.Msg)
 }
 
 func (e *weComAPIError) IsRetryable() bool {
-	return e.Code == -1 || e.Code == 6000
+	switch e.Code {
+	case -1, 6000, 40014, 42001:
+		return true
+	default:
+		return false
+	}
 }
 
 type weComHTTPStatusError struct {
-	Code int
-	Body string
+	Code     int
+	Body     string
+	Endpoint string
 }
 
 func (e *weComHTTPStatusError) Error() string {
-	return fmt.Sprintf("wecom response_url status %d: %s", e.Code, e.Body)
+	if e.Endpoint == "" {
+		return fmt.Sprintf("wecom-app http status %d: %s", e.Code, e.Body)
+	}
+	return fmt.Sprintf("wecom-app %s status %d: %s", e.Endpoint, e.Code, e.Body)
 }
 
-func newDefaultWeComClient(cfg config.WeComConfig) WeComClient {
+func newDefaultWeComClient(cfg config.WeComAppConfig) WeComClient {
 	return &defaultWeComClient{
 		httpClient: &http.Client{Timeout: 10 * time.Second},
+		cfg:        cfg,
 	}
 }
 
 func (c *defaultWeComClient) Close() {}
 
-func (c *defaultWeComClient) SendMessage(ctx context.Context, responseURL string, msg bus.OutboundMessage) error {
-	if strings.TrimSpace(responseURL) == "" {
-		return fmt.Errorf("wecom response_url is required")
+func (c *defaultWeComClient) SendMessage(ctx context.Context, msg bus.OutboundMessage) error {
+	toUser := strings.TrimSpace(msg.ChatID)
+	if toUser == "" {
+		return fmt.Errorf("wecom-app chat id is required")
 	}
 
-	content := truncateUTF8ByByteLimit(msg.Content, wecomMarkdownMaxBytes)
-	return c.sendTextWithRetry(ctx, responseURL, content)
+	msgType := resolveWeComOutboundMsgType(msg)
+	maxBytes := wecomTextMaxBytes
+	if msgType == wecomMsgTypeMarkdown {
+		maxBytes = wecomMarkdownMaxBytes
+	}
+
+	content := truncateUTF8ByByteLimit(msg.Content, maxBytes)
+	if strings.TrimSpace(content) == "" {
+		return fmt.Errorf("wecom-app message content is empty")
+	}
+
+	return c.sendWithRetry(ctx, toUser, content, msgType)
 }
 
-func (c *defaultWeComClient) sendTextWithRetry(ctx context.Context, responseURL, content string) error {
+func (c *defaultWeComClient) sendWithRetry(ctx context.Context, toUser, content, msgType string) error {
 	var lastErr error
 	for attempt := 1; attempt <= wecomSendMaxRetries; attempt++ {
-		err := c.sendTextOnce(ctx, responseURL, content)
+		err := c.sendOnce(ctx, toUser, content, msgType)
 		if err == nil {
 			return nil
 		}
@@ -102,6 +142,11 @@ func (c *defaultWeComClient) sendTextWithRetry(ctx context.Context, responseURL,
 		lastErr = err
 		if !c.shouldRetry(err) || attempt == wecomSendMaxRetries {
 			return err
+		}
+
+		var apiErr *weComAPIError
+		if errors.As(err, &apiErr) && (apiErr.Code == 40014 || apiErr.Code == 42001) {
+			c.clearAccessTokenCache()
 		}
 
 		backoff := time.Duration(attempt*attempt) * 100 * time.Millisecond
@@ -130,58 +175,153 @@ func (c *defaultWeComClient) shouldRetry(err error) bool {
 
 	var statusErr *weComHTTPStatusError
 	if errors.As(err, &statusErr) {
-		return statusErr.Code >= 500
+		return statusErr.Code >= 500 || statusErr.Code == http.StatusTooManyRequests
 	}
 
 	return true
 }
 
-func (c *defaultWeComClient) sendTextOnce(ctx context.Context, responseURL, content string) error {
+func (c *defaultWeComClient) sendOnce(ctx context.Context, toUser, content, msgType string) error {
+	token, err := c.getAccessToken(ctx)
+	if err != nil {
+		return err
+	}
+
 	payload := map[string]any{
-		"msgtype": "markdown",
-		"markdown": map[string]string{
-			"content": content,
-		},
+		"touser":  toUser,
+		"msgtype": msgType,
+		"agentid": c.cfg.AgentID,
+	}
+
+	switch msgType {
+	case wecomMsgTypeMarkdown:
+		payload["markdown"] = map[string]string{"content": content}
+	default:
+		payload["text"] = map[string]string{"content": content}
 	}
 
 	body, err := json.Marshal(payload)
 	if err != nil {
-		return fmt.Errorf("marshal wecom response_url payload: %w", err)
+		return fmt.Errorf("marshal wecom-app send payload: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, responseURL, bytes.NewReader(body))
+	sendURL := c.apiBaseURL() + "/cgi-bin/message/send?access_token=" + url.QueryEscape(token)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, sendURL, bytes.NewReader(body))
 	if err != nil {
-		return fmt.Errorf("create wecom response_url request: %w", err)
+		return fmt.Errorf("create wecom-app send request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("send wecom response_url message: %w", err)
+		return fmt.Errorf("send wecom-app message: %w", err)
 	}
 	defer resp.Body.Close()
 
 	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return &weComHTTPStatusError{
-			Code: resp.StatusCode,
-			Body: strings.TrimSpace(string(raw)),
+			Code:     resp.StatusCode,
+			Body:     strings.TrimSpace(string(raw)),
+			Endpoint: "message/send",
 		}
-	}
-
-	if len(strings.TrimSpace(string(raw))) == 0 {
-		return nil
 	}
 
 	var result weComSendResponse
 	if err := json.Unmarshal(raw, &result); err != nil {
-		return nil
+		return fmt.Errorf("decode wecom-app send response: %w", err)
 	}
 	if result.ErrCode != 0 {
 		return &weComAPIError{Code: result.ErrCode, Msg: result.ErrMsg}
 	}
 
 	return nil
+}
+
+func (c *defaultWeComClient) getAccessToken(ctx context.Context) (string, error) {
+	now := time.Now()
+	c.tokenMu.Lock()
+	if c.accessToken != "" && now.Before(c.accessTokenExp) {
+		token := c.accessToken
+		c.tokenMu.Unlock()
+		return token, nil
+	}
+	c.tokenMu.Unlock()
+
+	corpID := strings.TrimSpace(c.cfg.CorpID)
+	corpSecret := strings.TrimSpace(c.cfg.CorpSecret)
+	if corpID == "" || corpSecret == "" {
+		return "", fmt.Errorf("wecom-app corpId and corpSecret are required")
+	}
+
+	tokenURL := fmt.Sprintf(
+		"%s/cgi-bin/gettoken?corpid=%s&corpsecret=%s",
+		c.apiBaseURL(),
+		url.QueryEscape(corpID),
+		url.QueryEscape(corpSecret),
+	)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, tokenURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("create wecom-app gettoken request: %w", err)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("request wecom-app gettoken: %w", err)
+	}
+	defer resp.Body.Close()
+
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", &weComHTTPStatusError{
+			Code:     resp.StatusCode,
+			Body:     strings.TrimSpace(string(raw)),
+			Endpoint: "gettoken",
+		}
+	}
+
+	var result weComTokenResponse
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return "", fmt.Errorf("decode wecom-app gettoken response: %w", err)
+	}
+	if result.ErrCode != 0 {
+		return "", &weComAPIError{Code: result.ErrCode, Msg: result.ErrMsg}
+	}
+	if strings.TrimSpace(result.AccessToken) == "" {
+		return "", fmt.Errorf("wecom-app gettoken returned empty access_token")
+	}
+
+	ttlSeconds := result.ExpiresIn
+	if ttlSeconds <= 0 {
+		ttlSeconds = 7200
+	}
+	expireAt := time.Now().Add(time.Duration(ttlSeconds-300) * time.Second)
+	if ttlSeconds <= 300 {
+		expireAt = time.Now().Add(time.Duration(ttlSeconds) * time.Second)
+	}
+
+	c.tokenMu.Lock()
+	c.accessToken = result.AccessToken
+	c.accessTokenExp = expireAt
+	c.tokenMu.Unlock()
+
+	return result.AccessToken, nil
+}
+
+func (c *defaultWeComClient) clearAccessTokenCache() {
+	c.tokenMu.Lock()
+	c.accessToken = ""
+	c.accessTokenExp = time.Time{}
+	c.tokenMu.Unlock()
+}
+
+func (c *defaultWeComClient) apiBaseURL() string {
+	base := strings.TrimSpace(c.cfg.APIBaseURL)
+	if base == "" {
+		base = "https://qyapi.weixin.qq.com"
+	}
+	return strings.TrimRight(base, "/")
 }
 
 func truncateUTF8ByByteLimit(text string, maxBytes int) string {
@@ -201,6 +341,28 @@ func truncateUTF8ByByteLimit(text string, maxBytes int) string {
 		bytesCount += runeBytes
 	}
 	return text
+}
+
+func resolveWeComOutboundMsgType(msg bus.OutboundMessage) string {
+	if msg.Metadata == nil {
+		return wecomMsgTypeText
+	}
+
+	for _, key := range []string{"wecom_msgtype", "msgtype"} {
+		raw, ok := msg.Metadata[key]
+		if !ok {
+			continue
+		}
+		value := strings.ToLower(strings.TrimSpace(fmt.Sprintf("%v", raw)))
+		switch value {
+		case wecomMsgTypeMarkdown, "md":
+			return wecomMsgTypeMarkdown
+		case wecomMsgTypeText:
+			return wecomMsgTypeText
+		}
+	}
+
+	return wecomMsgTypeText
 }
 
 type weComMsgCache struct {
@@ -243,7 +405,7 @@ func (c *weComMsgCache) Seen(key string) bool {
 }
 
 func (c *weComMsgCache) gcLocked(now time.Time) {
-	if c.lastGC.IsZero() || now.Sub(c.lastGC) >= wecomDefaultMsgCacheScan {
+	if c.lastGC.IsZero() || now.Sub(c.lastGC) >= wecomDefaultMsgCacheGC {
 		for messageID, exp := range c.items {
 			if now.After(exp) {
 				delete(c.items, messageID)
@@ -253,113 +415,47 @@ func (c *weComMsgCache) gcLocked(now time.Time) {
 	}
 }
 
-type weComReplyTarget struct {
-	ResponseURL string
-	ExpiresAt   time.Time
-}
-
-type weComReplyCache struct {
-	mu     sync.Mutex
-	items  map[string]weComReplyTarget
-	ttl    time.Duration
-	lastGC time.Time
-}
-
-func newWeComReplyCache(ttl time.Duration) *weComReplyCache {
-	if ttl <= 0 {
-		ttl = wecomDefaultReplyCacheTTL
-	}
-	return &weComReplyCache{
-		items: make(map[string]weComReplyTarget),
-		ttl:   ttl,
-	}
-}
-
-func (c *weComReplyCache) Set(chatID, responseURL string) {
-	chatID = strings.TrimSpace(chatID)
-	responseURL = strings.TrimSpace(responseURL)
-	if chatID == "" || responseURL == "" {
-		return
-	}
-
-	now := time.Now()
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	c.items[chatID] = weComReplyTarget{
-		ResponseURL: responseURL,
-		ExpiresAt:   now.Add(c.ttl),
-	}
-	c.gcLocked(now)
-}
-
-func (c *weComReplyCache) Get(chatID string) (string, bool) {
-	chatID = strings.TrimSpace(chatID)
-	if chatID == "" {
-		return "", false
-	}
-
-	now := time.Now()
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	target, ok := c.items[chatID]
-	if !ok {
-		return "", false
-	}
-	if now.After(target.ExpiresAt) {
-		delete(c.items, chatID)
-		return "", false
-	}
-	c.gcLocked(now)
-	return target.ResponseURL, true
-}
-
-func (c *weComReplyCache) gcLocked(now time.Time) {
-	if c.lastGC.IsZero() || now.Sub(c.lastGC) >= wecomDefaultMsgCacheScan {
-		for chatID, target := range c.items {
-			if now.After(target.ExpiresAt) {
-				delete(c.items, chatID)
-			}
-		}
-		c.lastGC = now
-	}
-}
-
 type WeComChannel struct {
 	BaseChannel
-	cfg              config.WeComConfig
+	cfg              config.WeComAppConfig
 	server           *http.Server
 	cancel           context.CancelFunc
 	client           WeComClient
 	clientFactory    WeComClientFactory
 	allowlistEnabled bool
 	msgCache         *weComMsgCache
-	replyCache       *weComReplyCache
 	receiveID        string
+	webhookPath      string
 }
 
-var defaultWeComClientFactory WeComClientFactory = func(cfg config.WeComConfig) WeComClient {
+var defaultWeComClientFactory WeComClientFactory = func(cfg config.WeComAppConfig) WeComClient {
 	return newDefaultWeComClient(cfg)
 }
 
-func NewWeComChannel(cfg config.WeComConfig, b *bus.MessageBus) (*WeComChannel, error) {
+func NewWeComChannel(cfg config.WeComAppConfig, b *bus.MessageBus) (*WeComChannel, error) {
 	return NewWeComChannelWithFactory(cfg, b, defaultWeComClientFactory)
 }
 
-func NewWeComChannelWithFactory(cfg config.WeComConfig, b *bus.MessageBus, factory WeComClientFactory) (*WeComChannel, error) {
+func NewWeComChannelWithFactory(cfg config.WeComAppConfig, b *bus.MessageBus, factory WeComClientFactory) (*WeComChannel, error) {
 	if strings.TrimSpace(cfg.Token) == "" {
-		return nil, fmt.Errorf("wecom token is required")
+		return nil, fmt.Errorf("wecom-app token is required")
 	}
 	if len(strings.TrimSpace(cfg.EncodingAESKey)) != 43 {
-		return nil, fmt.Errorf("wecom encodingAESKey must be 43 chars")
+		return nil, fmt.Errorf("wecom-app encodingAESKey must be 43 chars")
+	}
+	if strings.TrimSpace(cfg.CorpID) == "" {
+		return nil, fmt.Errorf("wecom-app corpId is required")
+	}
+	if strings.TrimSpace(cfg.CorpSecret) == "" {
+		return nil, fmt.Errorf("wecom-app corpSecret is required")
+	}
+	if cfg.AgentID <= 0 {
+		return nil, fmt.Errorf("wecom-app agentId is required")
 	}
 
 	if factory == nil {
 		factory = defaultWeComClientFactory
 	}
-
-	receiveID := strings.TrimSpace(cfg.ReceiveID)
 
 	ch := &WeComChannel{
 		BaseChannel:      NewBaseChannel(wecomChannelName, b, cfg.AllowFrom),
@@ -367,11 +463,25 @@ func NewWeComChannelWithFactory(cfg config.WeComConfig, b *bus.MessageBus, facto
 		clientFactory:    factory,
 		allowlistEnabled: len(cfg.AllowFrom) > 0,
 		msgCache:         newWeComMsgCache(wecomDefaultMsgCacheTTL),
-		replyCache:       newWeComReplyCache(wecomDefaultReplyCacheTTL),
-		receiveID:        receiveID,
+		receiveID:        strings.TrimSpace(cfg.ReceiveID),
+		webhookPath:      normalizeWeComWebhookPath(cfg.WebhookPath),
 	}
 
 	return ch, nil
+}
+
+func normalizeWeComWebhookPath(path string) string {
+	trimmed := strings.TrimSpace(path)
+	if trimmed == "" {
+		return "/wecom-app"
+	}
+	if !strings.HasPrefix(trimmed, "/") {
+		trimmed = "/" + trimmed
+	}
+	if len(trimmed) > 1 {
+		trimmed = strings.TrimRight(trimmed, "/")
+	}
+	return trimmed
 }
 
 func (w *WeComChannel) Start(ctx context.Context) error {
@@ -384,7 +494,7 @@ func (w *WeComChannel) Start(ctx context.Context) error {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/wecom/bot", w.handleCallback)
+	mux.HandleFunc(w.webhookPath, w.handleCallback)
 
 	w.server = &http.Server{
 		Addr:    fmt.Sprintf(":%d", port),
@@ -392,9 +502,9 @@ func (w *WeComChannel) Start(ctx context.Context) error {
 	}
 
 	go func() {
-		log.Printf("[wecom] callback server listening on :%d", port)
+		log.Printf("[wecom-app] callback server listening on :%d%s", port, w.webhookPath)
 		if err := w.server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Printf("[wecom] server error: %v", err)
+			log.Printf("[wecom-app] server error: %v", err)
 		}
 	}()
 
@@ -416,26 +526,18 @@ func (w *WeComChannel) Stop() error {
 	if w.client != nil {
 		w.client.Close()
 	}
-	log.Printf("[wecom] stopped")
+	log.Printf("[wecom-app] stopped")
 	return nil
 }
 
 func (w *WeComChannel) Send(msg bus.OutboundMessage) error {
 	if w.client == nil {
-		return fmt.Errorf("wecom client not initialized")
+		return fmt.Errorf("wecom-app client not initialized")
 	}
-
-	chatID := strings.TrimSpace(msg.ChatID)
-	if chatID == "" {
-		return fmt.Errorf("wecom chat id is required")
+	if strings.TrimSpace(msg.ChatID) == "" {
+		return fmt.Errorf("wecom-app chat id is required")
 	}
-
-	responseURL, ok := w.replyCache.Get(chatID)
-	if !ok {
-		return fmt.Errorf("wecom response_url not found or expired for chat id %q", chatID)
-	}
-
-	return w.client.SendMessage(context.Background(), responseURL, msg)
+	return w.client.SendMessage(context.Background(), msg)
 }
 
 type weComEncryptedEnvelope struct {
@@ -457,6 +559,14 @@ func (e *weComEncryptedEnvelope) UnmarshalJSON(data []byte) error {
 
 func (e weComEncryptedEnvelope) CipherText() string {
 	return strings.TrimSpace(e.Encrypt)
+}
+
+type weComXMLEnvelope struct {
+	XMLName      xml.Name `xml:"xml"`
+	Encrypt      string   `xml:"Encrypt"`
+	MsgSignature string   `xml:"MsgSignature"`
+	TimeStamp    string   `xml:"TimeStamp"`
+	Nonce        string   `xml:"Nonce"`
 }
 
 type weComFrom struct {
@@ -482,16 +592,36 @@ type weComVoice struct {
 
 type weComInboundMessage struct {
 	MsgID       string     `json:"msgid"`
+	MsgIDAlt    string     `json:"MsgId"`
 	AIBotID     string     `json:"aibotid"`
 	ChatID      string     `json:"chatid"`
+	ChatIDAlt   string     `json:"ChatId"`
 	ChatType    string     `json:"chattype"`
+	ChatTypeAlt string     `json:"ChatType"`
 	From        weComFrom  `json:"from"`
 	FromUserID  string     `json:"fromuserid"`
-	ResponseURL string     `json:"response_url"`
+	FromName    string     `json:"FromUserName"`
 	MsgType     string     `json:"msgtype"`
+	MsgTypeAlt  string     `json:"MsgType"`
 	Text        weComText  `json:"text"`
+	Content     string     `json:"Content"`
 	Mixed       weComMixed `json:"mixed"`
 	Voice       weComVoice `json:"voice"`
+	Recognition string     `json:"Recognition"`
+}
+
+type weComXMLPlainMessage struct {
+	XMLName      xml.Name `xml:"xml"`
+	ToUserName   string   `xml:"ToUserName"`
+	FromUserName string   `xml:"FromUserName"`
+	CreateTime   string   `xml:"CreateTime"`
+	MsgType      string   `xml:"MsgType"`
+	Content      string   `xml:"Content"`
+	MsgID        string   `xml:"MsgId"`
+	AgentID      string   `xml:"AgentID"`
+	ChatID       string   `xml:"ChatId"`
+	ChatType     string   `xml:"ChatType"`
+	Recognition  string   `xml:"Recognition"`
 }
 
 type weComReplyEnvelope struct {
@@ -503,7 +633,7 @@ type weComReplyEnvelope struct {
 }
 
 func (w *WeComChannel) handleCallback(resp http.ResponseWriter, req *http.Request) {
-	sig := req.URL.Query().Get("msg_signature")
+	sig := resolveWeComSignatureParam(req)
 	timestamp := req.URL.Query().Get("timestamp")
 	nonce := req.URL.Query().Get("nonce")
 
@@ -520,6 +650,16 @@ func (w *WeComChannel) handleCallback(resp http.ResponseWriter, req *http.Reques
 	default:
 		http.Error(resp, "method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+func resolveWeComSignatureParam(req *http.Request) string {
+	query := req.URL.Query()
+	for _, key := range []string{"msg_signature", "msgsignature", "signature"} {
+		if value := strings.TrimSpace(query.Get(key)); value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func (w *WeComChannel) verifyCallbackURL(resp http.ResponseWriter, req *http.Request, sig, timestamp, nonce string) {
@@ -544,24 +684,35 @@ func (w *WeComChannel) verifyCallbackURL(resp http.ResponseWriter, req *http.Req
 	_, _ = resp.Write([]byte(plaintext))
 }
 
-func (w *WeComChannel) handleIncomingMessage(resp http.ResponseWriter, req *http.Request, sig, timestamp, nonce string) {
-	req.Body = http.MaxBytesReader(resp, req.Body, 1<<20) // 1MB limit
+func (w *WeComChannel) handleIncomingMessage(resp http.ResponseWriter, req *http.Request, querySig, queryTimestamp, queryNonce string) {
+	req.Body = http.MaxBytesReader(resp, req.Body, 1<<20)
 	body, err := io.ReadAll(req.Body)
 	if err != nil {
 		http.Error(resp, "read body failed", http.StatusBadRequest)
 		return
 	}
 
-	var envelope weComEncryptedEnvelope
-	if err := json.Unmarshal(body, &envelope); err != nil {
-		http.Error(resp, "invalid json", http.StatusBadRequest)
+	encrypt, bodySig, bodyTimestamp, bodyNonce, err := parseWeComEncryptedBody(body)
+	if err != nil {
+		http.Error(resp, "invalid payload", http.StatusBadRequest)
 		return
 	}
-
-	encrypt := envelope.CipherText()
 	if encrypt == "" {
 		http.Error(resp, "missing encrypt field", http.StatusBadRequest)
 		return
+	}
+
+	sig := querySig
+	if bodySig != "" {
+		sig = bodySig
+	}
+	timestamp := queryTimestamp
+	if bodyTimestamp != "" {
+		timestamp = bodyTimestamp
+	}
+	nonce := queryNonce
+	if bodyNonce != "" {
+		nonce = bodyNonce
 	}
 
 	if w.signature(timestamp, nonce, encrypt) != sig {
@@ -586,6 +737,27 @@ func (w *WeComChannel) handleIncomingMessage(resp http.ResponseWriter, req *http
 	_, _ = resp.Write(replyBody)
 
 	go w.processDecryptedMessage(plaintext)
+}
+
+func parseWeComEncryptedBody(body []byte) (encrypt, sig, timestamp, nonce string, err error) {
+	trimmed := strings.TrimSpace(string(body))
+	if trimmed == "" {
+		return "", "", "", "", fmt.Errorf("empty payload")
+	}
+
+	if strings.HasPrefix(trimmed, "<") {
+		var envelope weComXMLEnvelope
+		if unmarshalErr := xml.Unmarshal([]byte(trimmed), &envelope); unmarshalErr != nil {
+			return "", "", "", "", unmarshalErr
+		}
+		return strings.TrimSpace(envelope.Encrypt), strings.TrimSpace(envelope.MsgSignature), strings.TrimSpace(envelope.TimeStamp), strings.TrimSpace(envelope.Nonce), nil
+	}
+
+	var envelope weComEncryptedEnvelope
+	if unmarshalErr := json.Unmarshal([]byte(trimmed), &envelope); unmarshalErr != nil {
+		return "", "", "", "", unmarshalErr
+	}
+	return envelope.CipherText(), "", "", "", nil
 }
 
 func (w *WeComChannel) buildEncryptedReply(timestamp, nonce, receiveID string, payload any) ([]byte, error) {
@@ -621,9 +793,9 @@ func (w *WeComChannel) buildEncryptedReply(timestamp, nonce, receiveID string, p
 }
 
 func (w *WeComChannel) processDecryptedMessage(plaintext string) {
-	var message weComInboundMessage
-	if err := json.Unmarshal([]byte(plaintext), &message); err != nil {
-		log.Printf("[wecom] unmarshal plaintext json error: %v", err)
+	message, err := parseWeComInboundMessage(plaintext)
+	if err != nil {
+		log.Printf("[wecom-app] parse plaintext message error: %v", err)
 		return
 	}
 
@@ -633,24 +805,19 @@ func (w *WeComChannel) processDecryptedMessage(plaintext string) {
 	}
 
 	if !w.allowMessageFrom(senderID) {
-		log.Printf("[wecom] rejected message from %s", senderID)
+		log.Printf("[wecom-app] rejected message from %s", senderID)
 		return
 	}
 
-	messageID := strings.TrimSpace(message.MsgID)
+	messageID := message.normalizedMsgID()
 	if messageID != "" && w.msgCache.Seen(messageID) {
-		log.Printf("[wecom] duplicate message dropped: %s", messageID)
+		log.Printf("[wecom-app] duplicate message dropped: %s", messageID)
 		return
 	}
 
 	chatID := w.resolveChatID(message, senderID)
 	if chatID == "" {
 		return
-	}
-
-	responseURL := strings.TrimSpace(message.ResponseURL)
-	if responseURL != "" {
-		w.replyCache.Set(chatID, responseURL)
 	}
 
 	content := extractWeComContent(message)
@@ -665,14 +832,92 @@ func (w *WeComChannel) processDecryptedMessage(plaintext string) {
 		Content:   content,
 		Timestamp: time.Now(),
 		Metadata: map[string]any{
-			"msg_id":       messageID,
-			"aibot_id":     strings.TrimSpace(message.AIBotID),
-			"chat_id":      strings.TrimSpace(message.ChatID),
-			"chat_type":    strings.TrimSpace(message.ChatType),
-			"msg_type":     strings.TrimSpace(message.MsgType),
-			"response_url": responseURL,
+			"msg_id":    messageID,
+			"aibot_id":  strings.TrimSpace(message.AIBotID),
+			"chat_id":   strings.TrimSpace(message.normalizedChatID()),
+			"chat_type": strings.TrimSpace(message.normalizedChatType()),
+			"msg_type":  strings.TrimSpace(message.normalizedMsgType()),
 		},
 	}
+}
+
+func parseWeComInboundMessage(plaintext string) (weComInboundMessage, error) {
+	trimmed := strings.TrimSpace(plaintext)
+	if trimmed == "" {
+		return weComInboundMessage{}, fmt.Errorf("empty plaintext")
+	}
+
+	if strings.HasPrefix(trimmed, "<") {
+		var xmlMessage weComXMLPlainMessage
+		if err := xml.Unmarshal([]byte(trimmed), &xmlMessage); err != nil {
+			return weComInboundMessage{}, err
+		}
+
+		message := weComInboundMessage{
+			MsgID:      strings.TrimSpace(xmlMessage.MsgID),
+			FromUserID: strings.TrimSpace(xmlMessage.FromUserName),
+			FromName:   strings.TrimSpace(xmlMessage.FromUserName),
+			ChatID:     strings.TrimSpace(xmlMessage.ChatID),
+			ChatType:   strings.TrimSpace(xmlMessage.ChatType),
+			MsgType:    strings.TrimSpace(xmlMessage.MsgType),
+			Text: weComText{
+				Content: strings.TrimSpace(xmlMessage.Content),
+			},
+			Voice: weComVoice{
+				Content: strings.TrimSpace(xmlMessage.Recognition),
+			},
+			Recognition: strings.TrimSpace(xmlMessage.Recognition),
+			Content:     strings.TrimSpace(xmlMessage.Content),
+		}
+		message.normalize()
+		return message, nil
+	}
+
+	var message weComInboundMessage
+	if err := json.Unmarshal([]byte(trimmed), &message); err != nil {
+		return weComInboundMessage{}, err
+	}
+	message.normalize()
+
+	return message, nil
+}
+
+func (m *weComInboundMessage) normalize() {
+	if strings.TrimSpace(m.MsgID) == "" {
+		m.MsgID = strings.TrimSpace(m.MsgIDAlt)
+	}
+	if strings.TrimSpace(m.ChatID) == "" {
+		m.ChatID = strings.TrimSpace(m.ChatIDAlt)
+	}
+	if strings.TrimSpace(m.ChatType) == "" {
+		m.ChatType = strings.TrimSpace(m.ChatTypeAlt)
+	}
+	if strings.TrimSpace(m.MsgType) == "" {
+		m.MsgType = strings.TrimSpace(m.MsgTypeAlt)
+	}
+	if strings.TrimSpace(m.From.UserID) == "" {
+		if from := strings.TrimSpace(m.FromUserID); from != "" {
+			m.From.UserID = from
+		} else if from := strings.TrimSpace(m.FromName); from != "" {
+			m.From.UserID = from
+		}
+	}
+}
+
+func (m weComInboundMessage) normalizedMsgID() string {
+	return strings.TrimSpace(m.MsgID)
+}
+
+func (m weComInboundMessage) normalizedChatID() string {
+	return strings.TrimSpace(m.ChatID)
+}
+
+func (m weComInboundMessage) normalizedChatType() string {
+	return strings.TrimSpace(m.ChatType)
+}
+
+func (m weComInboundMessage) normalizedMsgType() string {
+	return strings.ToLower(strings.TrimSpace(m.MsgType))
 }
 
 func (w *WeComChannel) resolveSenderID(message weComInboundMessage) string {
@@ -680,24 +925,36 @@ func (w *WeComChannel) resolveSenderID(message weComInboundMessage) string {
 	if senderID != "" {
 		return senderID
 	}
-	return strings.TrimSpace(message.FromUserID)
+	if senderID = strings.TrimSpace(message.FromUserID); senderID != "" {
+		return senderID
+	}
+	return strings.TrimSpace(message.FromName)
 }
 
 func (w *WeComChannel) resolveChatID(message weComInboundMessage, senderID string) string {
-	if strings.EqualFold(strings.TrimSpace(message.ChatType), "group") {
-		if chatID := strings.TrimSpace(message.ChatID); chatID != "" {
+	if strings.EqualFold(message.normalizedChatType(), "group") {
+		if chatID := message.normalizedChatID(); chatID != "" {
 			return chatID
 		}
+	}
+	if chatID := message.normalizedChatID(); chatID != "" {
+		return chatID
 	}
 	return senderID
 }
 
 func extractWeComContent(message weComInboundMessage) string {
-	switch strings.ToLower(strings.TrimSpace(message.MsgType)) {
+	switch message.normalizedMsgType() {
 	case "text":
-		return strings.TrimSpace(message.Text.Content)
+		if content := strings.TrimSpace(message.Text.Content); content != "" {
+			return content
+		}
+		return strings.TrimSpace(message.Content)
 	case "voice":
-		return strings.TrimSpace(message.Voice.Content)
+		if content := strings.TrimSpace(message.Voice.Content); content != "" {
+			return content
+		}
+		return strings.TrimSpace(message.Recognition)
 	case "mixed":
 		parts := make([]string, 0, len(message.Mixed.MsgItem))
 		for _, item := range message.Mixed.MsgItem {
@@ -709,8 +966,10 @@ func extractWeComContent(message weComInboundMessage) string {
 			}
 		}
 		return strings.TrimSpace(strings.Join(parts, "\n"))
+	case "event":
+		return ""
 	default:
-		log.Printf("[wecom] unsupported message type: %s", strings.TrimSpace(message.MsgType))
+		log.Printf("[wecom-app] unsupported message type: %s", strings.TrimSpace(message.MsgType))
 		return ""
 	}
 }

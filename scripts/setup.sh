@@ -57,23 +57,34 @@ else
     TG_TOKEN=""
 fi
 
-# WeCom Bot
+# WeCom App (Self-built app)
 echo ""
-echo "--- WeCom Bot Channel ---"
-read -rp "Enable WeCom bot? [y/N]: " WECOM_ENABLED
-if [[ "$WECOM_ENABLED" =~ ^[Yy]$ ]]; then
-    WECOM_ENABLED="true"
-    read -rp "Token: " WECOM_TOKEN
-    read -rp "EncodingAESKey (43 chars): " WECOM_AES_KEY
-    read -rp "ReceiveID (optional, leave empty to skip strict check): " WECOM_RECEIVE_ID
-    read -rp "Callback port (default: 9886): " WECOM_PORT
-    WECOM_PORT="${WECOM_PORT:-9886}"
+echo "--- WeCom App Channel (Self-built app) ---"
+read -rp "Enable WeCom App? [y/N]: " WECOM_APP_ENABLED
+if [[ "$WECOM_APP_ENABLED" =~ ^[Yy]$ ]]; then
+    WECOM_APP_ENABLED="true"
+    read -rp "Webhook path (default: /wecom-app): " WECOM_APP_WEBHOOK_PATH
+    WECOM_APP_WEBHOOK_PATH="${WECOM_APP_WEBHOOK_PATH:-/wecom-app}"
+    read -rp "Token: " WECOM_APP_TOKEN
+    read -rp "EncodingAESKey (43 chars): " WECOM_APP_AES_KEY
+    read -rp "ReceiveID (optional, leave empty to skip strict check): " WECOM_APP_RECEIVE_ID
+    read -rp "CorpID: " WECOM_APP_CORP_ID
+    read -rp "CorpSecret: " WECOM_APP_CORP_SECRET
+    read -rp "AgentID (number): " WECOM_APP_AGENT_ID
+    read -rp "API base URL (optional, default: https://qyapi.weixin.qq.com): " WECOM_APP_API_BASE_URL
+    read -rp "Callback port (default: 9886): " WECOM_APP_PORT
+    WECOM_APP_PORT="${WECOM_APP_PORT:-9886}"
 else
-    WECOM_ENABLED="false"
-    WECOM_TOKEN=""
-    WECOM_AES_KEY=""
-    WECOM_RECEIVE_ID=""
-    WECOM_PORT="9886"
+    WECOM_APP_ENABLED="false"
+    WECOM_APP_WEBHOOK_PATH="/wecom-app"
+    WECOM_APP_TOKEN=""
+    WECOM_APP_AES_KEY=""
+    WECOM_APP_RECEIVE_ID=""
+    WECOM_APP_CORP_ID=""
+    WECOM_APP_CORP_SECRET=""
+    WECOM_APP_AGENT_ID="0"
+    WECOM_APP_API_BASE_URL=""
+    WECOM_APP_PORT="9886"
 fi
 
 # Write config
@@ -109,12 +120,17 @@ cat > "$CONFIG_FILE" <<EOF_JSON
       "port": ${FEISHU_PORT},
       "allowFrom": []
     },
-    "wecom": {
-      "enabled": ${WECOM_ENABLED},
-      "token": "${WECOM_TOKEN}",
-      "encodingAESKey": "${WECOM_AES_KEY}",
-      "receiveId": "${WECOM_RECEIVE_ID}",
-      "port": ${WECOM_PORT},
+    "wecom-app": {
+      "enabled": ${WECOM_APP_ENABLED},
+      "webhookPath": "${WECOM_APP_WEBHOOK_PATH}",
+      "token": "${WECOM_APP_TOKEN}",
+      "encodingAESKey": "${WECOM_APP_AES_KEY}",
+      "receiveId": "${WECOM_APP_RECEIVE_ID}",
+      "corpId": "${WECOM_APP_CORP_ID}",
+      "corpSecret": "${WECOM_APP_CORP_SECRET}",
+      "agentId": ${WECOM_APP_AGENT_ID},
+      "apiBaseUrl": "${WECOM_APP_API_BASE_URL}",
+      "port": ${WECOM_APP_PORT},
       "allowFrom": []
     }
   },
@@ -141,8 +157,9 @@ echo "  make gateway    # Start gateway"
 if [ "$FEISHU_ENABLED" = "true" ]; then
     echo "  make tunnel     # Start cloudflared tunnel for Feishu webhook"
 fi
-if [ "$WECOM_ENABLED" = "true" ]; then
-    echo "  Configure callback URL to /wecom/bot"
+if [ "$WECOM_APP_ENABLED" = "true" ]; then
+    echo "  Configure callback URL to ${WECOM_APP_WEBHOOK_PATH}"
+    echo "  Add server public IP to WeCom trusted IP list"
 fi
 echo ""
 echo "Done."
