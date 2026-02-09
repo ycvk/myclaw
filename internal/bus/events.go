@@ -24,10 +24,3 @@ type OutboundMessage struct {
 	Media    []string
 	Metadata map[string]any
 }
-
-func a(aa any) {
-	_, ok := aa.(string)
-	if ok {
-
-	}
-}
